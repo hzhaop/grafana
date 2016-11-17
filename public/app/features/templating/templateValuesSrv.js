@@ -8,7 +8,7 @@ function (angular, _, kbn) {
 
   var module = angular.module('grafana.services');
 
-  module.service('templateValuesSrv', function($q, $rootScope, datasourceSrv, $location, templateSrv, timeSrv) {
+  module.service('templateValuesSrv', function($q, $rootScope, datasourceSrv, $location, templateSrv, timeSrv, $http) {
     var self = this;
     this.variableLock = {};
 
@@ -60,7 +60,6 @@ function (angular, _, kbn) {
     this.processVariable = function(variable, queryParams) {
       var dependencies = [];
       var lock = self.variableLock[variable.name];
-
       // determine our dependencies.
       if (variable.type === "query") {
         _.forEach(this.variables, function(v) {
@@ -71,28 +70,29 @@ function (angular, _, kbn) {
           }
         });
       }
-
-      return $q.all(dependencies).then(function() {
-        var urlValue = queryParams['var-' + variable.name];
-        if (urlValue !== void 0) {
-          return self.setVariableFromUrl(variable, urlValue).then(lock.resolve);
-        }
-        else if (variable.refresh === 1 || variable.refresh === 2) {
-          return self.updateOptions(variable).then(function() {
-            if (_.isEmpty(variable.current) && variable.options.length) {
-              self.setVariableValue(variable, variable.options[0]);
-            }
+      return self._resolveRmsUuids(variable).then(function(variable) {
+        return $q.all(dependencies).then(function() {
+          var urlValue = queryParams['var-' + variable.name];
+          if (urlValue !== void 0) {
+            return self.setVariableFromUrl(variable, urlValue).then(lock.resolve);
+          }
+          else if (variable.refresh === 1 || variable.refresh === 2) {
+            return self.updateOptions(variable).then(function() {
+              if (_.isEmpty(variable.current) && variable.options.length) {
+                self.setVariableValue(variable, variable.options[0]);
+              }
+              lock.resolve();
+            });
+          }
+          else if (variable.type === 'interval') {
+            self.updateAutoInterval(variable);
             lock.resolve();
-          });
-        }
-        else if (variable.type === 'interval') {
-          self.updateAutoInterval(variable);
-          lock.resolve();
-        } else {
-          lock.resolve();
-        }
-      }).finally(function() {
-        delete self.variableLock[variable.name];
+          } else {
+            lock.resolve();
+          }
+        }).finally(function() {
+          delete self.variableLock[variable.name];
+        });
       });
     };
 
@@ -220,15 +220,84 @@ function (angular, _, kbn) {
       variable.options = options;
     };
 
+    this._getHttpVariableOptions = function(variable) {
+      variable.options = [];
+      return $http({
+        method: 'GET',
+        url: variable.query,
+        params: {'variable': variable.name}
+      }).then(function successCallback(response) {
+        return _.sortBy(response.data, 'text');
+      }, function errorCallback() {
+        return [{text: 'Failed to load http variable values', value: ''}];
+      });
+    };
+
+    this._resolveRmsUuids = function(variable) {
+      var re = new RegExp("^[0-9a-f]{8}-?[0-9a-f]{4}-?[1-5][0-9a-f]{3}-?[89ab][0-9a-f]{3}-?[0-9a-f]{12}$");
+      // Retarded syntax for a list comprehension
+      var uuids = _.chain(variable.options)
+        .filter(function(option) {
+          return re.test(option.text);
+        })
+        .map(function(option) {
+          return option.text;
+        }).value();
+      if (uuids.length === 0) {
+        return $q.when(variable);
+      }
+      return $http({
+        method: 'POST',
+        url: '/api/v1/nodes/grafana-hosts/',
+        data: {'nodes': uuids}
+      }).then(function successCallback(response) {
+        var mappings = {};
+        _.each(response.data, function(option) {
+          mappings[option.value] = option;
+        });
+        variable.options = _.chain(variable.options)
+          .map(function(option) {
+            if (option.value in mappings) {
+              return mappings[option.value];
+            } else {
+              return option;
+            }
+          })
+          .filter(function(option) {
+            // Remove any uuids that failed to be mapped
+            // The host likely doesn't exist anymore but has stale metrics
+            return !(option.text === option.value && re.test(option.text));
+          }).sortBy('text').value();
+        // check if 'current' needs translation too
+        if (!_.isArray(variable.current.value) && variable.current.value in mappings) {
+          variable.current.text = mappings[variable.current.value].text;
+        }
+        return variable;
+      }, function errorCallback() {
+        variable.options.push({text: 'Failed to map uuid variable values', value: ''});
+        return variable;
+      });
+    };
+
     this.updateOptions = function(variable) {
+      if (variable.type === 'http') {
+        return self._getHttpVariableOptions(variable).then(function(options) {
+          variable.options = options;
+          return self.validateVariableSelectionState(variable);
+        });
+      }
+
       if (variable.type !== 'query') {
         self._updateNonQueryVariable(variable);
-        return self.validateVariableSelectionState(variable);
+        return self._resolveRmsUuids(variable).then(function(variable) {
+          return self.validateVariableSelectionState(variable);
+        });
       }
 
       return datasourceSrv.get(variable.datasource)
         .then(_.partial(this.updateOptionsFromMetricFindQuery, variable))
         .then(_.partial(this.updateTags, variable))
+        .then(_.partial(this._resolveRmsUuids, variable))
         .then(_.partial(this.validateVariableSelectionState, variable));
     };
 
@@ -356,10 +425,8 @@ function (angular, _, kbn) {
             text = value;
           }
         }
-
         options[value] = {text: text, value: value};
       }
-
       return _.sortBy(options, 'text');
     };
 

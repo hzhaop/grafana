@@ -94,6 +94,8 @@ function(angular, _) {
 
         // ignore collapse state
         row.collapse = false;
+        // ignore scoped vars at the row level too
+        row.scopedVars = null;
         return true;
       });
 
